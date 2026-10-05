@@ -152,14 +152,25 @@ static void bilateral_filter_local(
     }
 }
 
+/* Compare the saved test JPEG against the saved serial JPEG.
+ * Both sides must go through the same 8-bit quantisation + JPEG codec;
+ * comparing the raw float output against a decoded JPEG would measure
+ * JPEG compression loss instead of parallel-vs-serial differences.     */
 static void write_quality_report(const char *txt_path, const char *label,
-                                  const float *tst, int n)
+                                  const char *tst_path, int n)
 {
     float *ref = (float *)malloc((size_t)n * n * sizeof(float));
-    if (!ref) { fprintf(stderr, "malloc failed in write_quality_report\n"); return; }
+    float *tst = (float *)malloc((size_t)n * n * sizeof(float));
+    if (!ref || !tst) {
+        fprintf(stderr, "malloc failed in write_quality_report\n");
+        free(ref); free(tst); return;
+    }
     if (load_jpg("out_serial.jpg", ref, n) != 0) {
         fprintf(stderr, "Cannot load out_serial.jpg — run bilateral_serial first\n");
-        free(ref); return;
+        free(ref); free(tst); return;
+    }
+    if (load_jpg(tst_path, tst, n) != 0) {
+        free(ref); free(tst); return;
     }
 
     size_t npix = (size_t)n * n;
@@ -178,11 +189,12 @@ static void write_quality_report(const char *txt_path, const char *label,
     double psnr = (mse < 1e-15) ? 999.0 : 10.0 * log10(255.0 * 255.0 / mse);
 
     FILE *fp = fopen(txt_path, "w");
-    if (!fp) { fprintf(stderr, "Cannot write %s\n", txt_path); free(ref); return; }
+    if (!fp) { fprintf(stderr, "Cannot write %s\n", txt_path); free(ref); free(tst); return; }
     fprintf(fp, "Bilateral Filter Quality Metrics\n");
     fprintf(fp, "================================\n");
     fprintf(fp, "Version   : %s\n", label);
     fprintf(fp, "Reference : out_serial.jpg (serial baseline)\n");
+    fprintf(fp, "Test      : %s\n", tst_path);
     fprintf(fp, "Pixels    : %zu (%dx%d)\n", npix, n, n);
     fprintf(fp, "MSE       : %.6f\n", mse);
     fprintf(fp, "PSNR      : %.4f dB\n", psnr);
@@ -198,7 +210,7 @@ static void write_quality_report(const char *txt_path, const char *label,
 
     printf("Quality metrics saved to %s\n", txt_path);
     printf("  MSE=%.6f  PSNR=%.4f dB  MAE=%.6f\n", mse, psnr, mae);
-    free(ref);
+    free(ref); free(tst);
 }
 
 /* ── Helper: build and dispatch one chunk to a worker ───────────────── */
@@ -310,7 +322,7 @@ static int run_master(int size)
     snprintf(txt_path, sizeof(txt_path), "quality_mpi_dynamic_P%d.txt", size);
     char label[32];
     snprintf(label, sizeof(label), "MPI_dynamic P=%d", size);
-    write_quality_report(txt_path, label, full_out, N);
+    write_quality_report(txt_path, label, "out_mpi_dynamic.jpg", N);
 
     free(worker_comp);
     free(full_img);

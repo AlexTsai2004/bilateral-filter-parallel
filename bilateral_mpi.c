@@ -86,14 +86,25 @@ static int load_jpg(const char *path, float *dst, int n)
     return 0;
 }
 
+/* Compare the saved test JPEG against the saved serial JPEG.
+ * Both sides must go through the same 8-bit quantisation + JPEG codec;
+ * comparing the raw float output against a decoded JPEG would measure
+ * JPEG compression loss instead of parallel-vs-serial differences.     */
 static void write_quality_report(const char *txt_path, const char *label,
-                                  const float *tst, int n)
+                                  const char *tst_path, int n)
 {
     float *ref = (float *)malloc((size_t)n * n * sizeof(float));
-    if (!ref) { fprintf(stderr, "malloc failed in write_quality_report\n"); return; }
+    float *tst = (float *)malloc((size_t)n * n * sizeof(float));
+    if (!ref || !tst) {
+        fprintf(stderr, "malloc failed in write_quality_report\n");
+        free(ref); free(tst); return;
+    }
     if (load_jpg("out_serial.jpg", ref, n) != 0) {
         fprintf(stderr, "Cannot load out_serial.jpg — run bilateral_serial first\n");
-        free(ref); return;
+        free(ref); free(tst); return;
+    }
+    if (load_jpg(tst_path, tst, n) != 0) {
+        free(ref); free(tst); return;
     }
 
     size_t npix = (size_t)n * n;
@@ -112,11 +123,12 @@ static void write_quality_report(const char *txt_path, const char *label,
     double psnr = (mse < 1e-15) ? 999.0 : 10.0 * log10(255.0 * 255.0 / mse);
 
     FILE *fp = fopen(txt_path, "w");
-    if (!fp) { fprintf(stderr, "Cannot write %s\n", txt_path); free(ref); return; }
+    if (!fp) { fprintf(stderr, "Cannot write %s\n", txt_path); free(ref); free(tst); return; }
     fprintf(fp, "Bilateral Filter Quality Metrics\n");
     fprintf(fp, "================================\n");
     fprintf(fp, "Version   : %s\n", label);
     fprintf(fp, "Reference : out_serial.jpg (serial baseline)\n");
+    fprintf(fp, "Test      : %s\n", tst_path);
     fprintf(fp, "Pixels    : %zu (%dx%d)\n", npix, n, n);
     fprintf(fp, "MSE       : %.6f\n", mse);
     fprintf(fp, "PSNR      : %.4f dB\n", psnr);
@@ -132,7 +144,7 @@ static void write_quality_report(const char *txt_path, const char *label,
 
     printf("Quality metrics saved to %s\n", txt_path);
     printf("  MSE=%.6f  PSNR=%.4f dB  MAE=%.6f\n", mse, psnr, mae);
-    free(ref);
+    free(ref); free(tst);
 }
 
 /* Filter local_rows rows stored in src.
@@ -190,12 +202,14 @@ int main(int argc, char **argv)
     int rem      = N % size;
     int my_rows  = base + (rank < rem ? 1 : 0);
 
-    if (my_rows < RADIUS) {
+    /* Check the smallest partition (base) so every rank takes the same branch
+     * and rank 0 — which may own base+1 rows — still reports the error.     */
+    if (base < RADIUS) {
         /* MPI_Abort (not MPI_Finalize) so that ranks with more rows do not
          * hang waiting at the subsequent collectives (Scatterv/Gatherv).   */
         if (rank == 0)
             fprintf(stderr, "Error: rows per process (%d) < RADIUS (%d). "
-                    "Reduce process count.\n", my_rows, RADIUS);
+                    "Reduce process count.\n", base, RADIUS);
         MPI_Abort(MPI_COMM_WORLD, 1);
         return 1;
     }
@@ -245,28 +259,27 @@ int main(int argc, char **argv)
 
     /* ---- ghost-row exchange with MPI_Sendrecv ----
      *
-     * Each rank simultaneously:
-     *   • sends its first RADIUS rows up   (neighbour above needs them as bottom ghost)
-     *   • receives last  RADIUS rows from above (fills this rank's top ghost)
-     *   • sends its last  RADIUS rows down (neighbour below needs them as top ghost)
-     *   • receives first RADIUS rows from below (fills this rank's bottom ghost)
+     * Two phases, every rank participates in both (MPI_PROC_NULL at the
+     * image boundary turns the missing side into a no-op):
+     *   phase 1: send first RADIUS rows up,  receive bottom ghost from below
+     *   phase 2: send last  RADIUS rows down, receive top ghost from above
+     *
+     * Doing "talk to rank-1, then talk to rank+1" instead makes rank r wait
+     * for rank r-1 to finish its own first exchange, so the exchanges form a
+     * chain 0→1→…→P-1 and communication time grows linearly with P.
      */
+    int up   = (rank > 0)        ? rank - 1 : MPI_PROC_NULL;
+    int down = (rank < size - 1) ? rank + 1 : MPI_PROC_NULL;
     MPI_Status status;
     double comm_start = MPI_Wtime();
-    if (rank > 0) {
-        MPI_Sendrecv(
-            local_core,               RADIUS * N, MPI_FLOAT, rank - 1, TAG_DOWN,
-            padded,                   RADIUS * N, MPI_FLOAT, rank - 1, TAG_UP,
-            MPI_COMM_WORLD, &status);
-    }
-    if (rank < size - 1) {
-        MPI_Sendrecv(
-            local_core + (size_t)(my_rows - RADIUS) * N,
-            RADIUS * N, MPI_FLOAT, rank + 1, TAG_UP,
-            padded + (size_t)(top_gh + my_rows) * N,
-            RADIUS * N, MPI_FLOAT, rank + 1, TAG_DOWN,
-            MPI_COMM_WORLD, &status);
-    }
+    MPI_Sendrecv(
+        local_core,                                RADIUS * N, MPI_FLOAT, up,   TAG_UP,
+        padded + (size_t)(top_gh + my_rows) * N,   RADIUS * N, MPI_FLOAT, down, TAG_UP,
+        MPI_COMM_WORLD, &status);
+    MPI_Sendrecv(
+        local_core + (size_t)(my_rows - RADIUS) * N, RADIUS * N, MPI_FLOAT, down, TAG_DOWN,
+        padded,                                      RADIUS * N, MPI_FLOAT, up,   TAG_DOWN,
+        MPI_COMM_WORLD, &status);
     double comm_time_local = MPI_Wtime() - comm_start;
 
     /* ---- bilateral filter on local partition ---- */
@@ -305,7 +318,7 @@ int main(int argc, char **argv)
         snprintf(txt_path, sizeof(txt_path), "quality_mpi_static_P%d.txt", size);
         char label[32];
         snprintf(label, sizeof(label), "MPI_static P=%d", size);
-        write_quality_report(txt_path, label, full_out, N);
+        write_quality_report(txt_path, label, "out_mpi_static.jpg", N);
 
         free(full_img); free(full_out);
     }
